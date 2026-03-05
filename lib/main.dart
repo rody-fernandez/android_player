@@ -30,6 +30,7 @@ class _PairingScreenState extends State<PairingScreen> {
   String playerName = "ANDROID-BOX";
   String pairCode = "----";
   String status = "Iniciando…";
+  String lastError = "";
 
   @override
   void initState() {
@@ -57,20 +58,38 @@ class _PairingScreenState extends State<PairingScreen> {
 
   Future<void> _register(SharedPreferences prefs) async {
     try {
-      setState(() => status = "Registrando en CMS…");
+      setState(() {
+        status = "Registrando en CMS…";
+        lastError = "";
+      });
 
-      final res = await http.post(
-        Uri.parse("$serverUrl/api/player/register"),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"name": playerName}),
-      );
+      final uri = Uri.parse("$serverUrl/api/player/register");
+      final res = await http
+          .post(
+            uri,
+            headers: {"Content-Type": "application/json"},
+            body: jsonEncode({"name": playerName}),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        setState(() {
+          status = "Error HTTP: ${res.statusCode}";
+          lastError = res.body;
+        });
+        return;
+      }
 
       final j = jsonDecode(res.body);
+
       final token = (j["token"] ?? "").toString();
       final code = (j["pairing_code"] ?? "").toString();
 
       if (token.isEmpty || code.isEmpty) {
-        setState(() => status = "Respuesta inválida del servidor");
+        setState(() {
+          status = "Servidor respondió sin pairing_code";
+          lastError = res.body;
+        });
         return;
       }
 
@@ -82,7 +101,10 @@ class _PairingScreenState extends State<PairingScreen> {
         status = "Esperando vinculación…";
       });
     } catch (e) {
-      setState(() => status = "Error de red: $e");
+      setState(() {
+        status = "Error de red";
+        lastError = e.toString();
+      });
     }
   }
 
@@ -91,23 +113,54 @@ class _PairingScreenState extends State<PairingScreen> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
-        alignment: Alignment.topLeft, // ✅ 0,0
+        alignment: Alignment.topLeft,
         children: [
-          // overlay arriba-izquierda
           Positioned(
             top: 0,
             left: 0,
+            right: 0,
             child: Container(
               padding: const EdgeInsets.all(14),
-              color: Colors.black.withOpacity(0.65),
-              child: Text(
-                "$status\n\nServidor:\n$serverUrl\n\nPlayer:\n$playerName",
-                style: const TextStyle(color: Colors.white, fontSize: 14),
+              color: Colors.black.withOpacity(0.70),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "Servidor:\n$serverUrl",
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    "Player:\n$playerName",
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    "Estado:\n$status",
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                  ),
+                  if (lastError.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      "Detalle:\n$lastError",
+                      style: const TextStyle(
+                        color: Colors.redAccent,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 10),
+                  ElevatedButton(
+                    onPressed: () async {
+                      final prefs = await SharedPreferences.getInstance();
+                      await _register(prefs);
+                    },
+                    child: const Text("Reintentar"),
+                  ),
+                ],
               ),
             ),
           ),
-
-          // código grande
           Center(
             child: Column(
               mainAxisSize: MainAxisSize.min,
