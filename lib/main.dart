@@ -4,7 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:video_player/video_player.dart';
+import 'package:flutter_vlc_player/flutter_vlc_player.dart';
 
 void main() {
   runApp(const MegaSignagePlayerApp());
@@ -30,9 +30,15 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
+  // =========================
+  // CONFIG
+  // =========================
   String serverUrl = "http://192.168.134.1:3000";
   String playerName = "ANDROID-BOX";
 
+  // =========================
+  // ESTADO GENERAL
+  // =========================
   String token = "";
   String pairCode = "----";
   String status = "Iniciando...";
@@ -45,11 +51,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Timer? heartbeatTimer;
   Timer? configTimer;
+  Timer? imageTimer;
+  Timer? playbackWatchdogTimer;
+
   int currentIndex = 0;
 
-  VideoPlayerController? _videoController;
-  bool _showImage = false;
-  String _imageUrl = "";
+  // =========================
+  // VLC / MEDIA
+  // =========================
+  VlcPlayerController? vlcController;
+  bool showingImage = false;
+  String currentImageUrl = "";
+  bool loadingContent = false;
+  int vlcWidgetVersion = 0; // fuerza recreación del widget VLC
 
   @override
   void initState() {
@@ -61,10 +75,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void dispose() {
     heartbeatTimer?.cancel();
     configTimer?.cancel();
-    _videoController?.dispose();
+    imageTimer?.cancel();
+    playbackWatchdogTimer?.cancel();
+    safeDisposeVlc();
     super.dispose();
   }
 
+  // =========================
+  // INICIO
+  // =========================
   Future<void> boot() async {
     final prefs = await SharedPreferences.getInstance();
 
@@ -151,6 +170,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  // =========================
+  // HEARTBEAT
+  // =========================
   void startHeartbeat() {
     heartbeatTimer?.cancel();
 
@@ -164,6 +186,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           body: jsonEncode({"token": token}),
         );
       } catch (e) {
+        if (!mounted) return;
         setState(() {
           lastError = "Heartbeat error: $e";
         });
@@ -171,10 +194,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
   }
 
+  // =========================
+  // CONFIG POLLING
+  // =========================
   void startConfigPolling() {
     configTimer?.cancel();
 
-    configTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+    configTimer = Timer.periodic(const Duration(seconds: 3), (timer) async {
       await fetchConfig();
     });
   }
@@ -210,7 +236,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
 
       final playlist = data["playlist"];
-      final newItems = data["items"] is List ? data["items"] as List : [];
+      final List<dynamic> newItems = data["items"] is List
+          ? List<dynamic>.from(data["items"])
+          : [];
 
       final changed = jsonEncode(items) != jsonEncode(newItems);
 
@@ -230,12 +258,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await playCurrentItem();
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         lastError = "Config error: $e";
       });
     }
   }
 
+  // =========================
+  // HELPERS
+  // =========================
   String absoluteUrl(String url) {
     if (url.startsWith("http://") || url.startsWith("https://")) return url;
     return "$serverUrl$url";
@@ -257,22 +289,50 @@ class _PlayerScreenState extends State<PlayerScreen> {
         u.endsWith(".m4v");
   }
 
+  Future<void> safeDisposeVlc() async {
+    final old = vlcController;
+    vlcController = null;
+
+    if (old != null) {
+      try {
+        await old.stop();
+      } catch (_) {}
+
+      try {
+        await old.dispose();
+      } catch (_) {}
+    }
+  }
+
+  // =========================
+  // REPRODUCCIÓN
+  // =========================
   Future<void> playCurrentItem() async {
     if (items.isEmpty) return;
+
+    imageTimer?.cancel();
+    playbackWatchdogTimer?.cancel();
 
     final item = items[currentIndex];
     final url = absoluteUrl((item["url"] ?? "").toString());
 
-    if (isImageFile(url)) {
-      await _videoController?.dispose();
-      _videoController = null;
+    if (!mounted) return;
+    setState(() {
+      loadingContent = true;
+      lastError = "";
+    });
 
+    if (isImageFile(url)) {
+      await safeDisposeVlc();
+
+      if (!mounted) return;
       setState(() {
-        _showImage = true;
-        _imageUrl = url;
+        showingImage = true;
+        currentImageUrl = url;
+        loadingContent = false;
       });
 
-      Future.delayed(const Duration(seconds: 8), () async {
+      imageTimer = Timer(const Duration(seconds: 8), () async {
         if (!mounted || items.isEmpty) return;
         currentIndex = (currentIndex + 1) % items.length;
         await playCurrentItem();
@@ -281,52 +341,120 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     if (isVideoFile(url)) {
-      await _videoController?.dispose();
-      _videoController = VideoPlayerController.networkUrl(Uri.parse(url));
-
       try {
-        await _videoController!.initialize();
-        await _videoController!.setLooping(false);
-        await _videoController!.play();
+        await safeDisposeVlc();
 
-        _videoController!.addListener(() async {
-          if (!mounted || _videoController == null) return;
-          final controller = _videoController!;
-          if (controller.value.isInitialized &&
-              !controller.value.isPlaying &&
-              controller.value.position >= controller.value.duration) {
-            controller.removeListener(() {});
+        // importante: primero vaciar UI de video anterior
+        if (!mounted) return;
+        setState(() {
+          showingImage = false;
+          currentImageUrl = "";
+          loadingContent = true;
+          vlcWidgetVersion++;
+        });
+
+        // pequeña pausa para que Flutter destruya el widget anterior
+        await Future.delayed(const Duration(milliseconds: 250));
+
+        final controller = VlcPlayerController.network(
+          url,
+          autoPlay: true,
+          hwAcc: HwAcc.auto,
+          options: VlcPlayerOptions(),
+        );
+
+        vlcController = controller;
+
+        if (!mounted) return;
+        setState(() {
+          loadingContent = false;
+        });
+
+        playbackWatchdogTimer = Timer.periodic(const Duration(seconds: 1), (
+          timer,
+        ) async {
+          if (!mounted) {
+            timer.cancel();
+            return;
+          }
+
+          final c = vlcController;
+          if (c == null) {
+            timer.cancel();
+            return;
+          }
+
+          final value = c.value;
+
+          if (!paired || items.isEmpty) {
+            timer.cancel();
+            return;
+          }
+
+          if (value.hasError) {
+            timer.cancel();
+            setState(() {
+              lastError = "VLC error: ${value.errorDescription}";
+            });
+
+            Future.delayed(const Duration(seconds: 2), () async {
+              if (!mounted || items.isEmpty) return;
+              currentIndex = (currentIndex + 1) % items.length;
+              await playCurrentItem();
+            });
+            return;
+          }
+
+          if (value.isEnded == true) {
+            timer.cancel();
             currentIndex = (currentIndex + 1) % items.length;
             await playCurrentItem();
           }
         });
-
-        setState(() {
-          _showImage = false;
-        });
       } catch (e) {
+        if (!mounted) return;
         setState(() {
-          lastError = "Video error: $e";
+          loadingContent = false;
+          lastError = "No se pudo iniciar video: $e";
+        });
+
+        Future.delayed(const Duration(seconds: 2), () async {
+          if (!mounted || items.isEmpty) return;
+          currentIndex = (currentIndex + 1) % items.length;
+          await playCurrentItem();
         });
       }
       return;
     }
 
+    if (!mounted) return;
     setState(() {
+      loadingContent = false;
       lastError = "Formato no soportado: $url";
+    });
+
+    Future.delayed(const Duration(seconds: 2), () async {
+      if (!mounted || items.isEmpty) return;
+      currentIndex = (currentIndex + 1) % items.length;
+      await playCurrentItem();
     });
   }
 
+  // =========================
+  // RESET PLAYER
+  // =========================
   Future<void> resetPlayer() async {
     heartbeatTimer?.cancel();
     configTimer?.cancel();
-    await _videoController?.dispose();
-    _videoController = null;
+    imageTimer?.cancel();
+    playbackWatchdogTimer?.cancel();
+    await safeDisposeVlc();
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove("token");
     await prefs.remove("pair_code");
 
+    if (!mounted) return;
     setState(() {
       token = "";
       pairCode = "----";
@@ -336,50 +464,65 @@ class _PlayerScreenState extends State<PlayerScreen> {
       items = [];
       status = "Reiniciando...";
       lastError = "";
-      _showImage = false;
-      _imageUrl = "";
+      showingImage = false;
+      currentImageUrl = "";
       currentIndex = 0;
+      loadingContent = false;
+      vlcWidgetVersion++;
     });
 
     await registerPlayer();
   }
 
+  // =========================
+  // UI
+  // =========================
   @override
   Widget build(BuildContext context) {
     Widget content;
 
     if (paired && items.isNotEmpty) {
-      if (_showImage && _imageUrl.isNotEmpty) {
+      if (loadingContent) {
+        content = const Center(
+          child: Text(
+            "Cargando contenido...",
+            style: TextStyle(color: Colors.white, fontSize: 24),
+          ),
+        );
+      } else if (showingImage && currentImageUrl.isNotEmpty) {
         content = Positioned.fill(
           child: Image.network(
-            _imageUrl,
+            currentImageUrl,
             fit: BoxFit.contain,
             alignment: Alignment.topLeft,
             errorBuilder: (_, __, ___) => const Center(
               child: Text(
                 "Error cargando imagen",
-                style: TextStyle(color: Colors.red),
+                style: TextStyle(color: Colors.red, fontSize: 22),
               ),
             ),
           ),
         );
-      } else if (_videoController != null &&
-          _videoController!.value.isInitialized) {
+      } else if (vlcController != null) {
         content = Positioned.fill(
-          child: FittedBox(
-            fit: BoxFit.contain,
+          child: Align(
             alignment: Alignment.topLeft,
             child: SizedBox(
-              width: _videoController!.value.size.width,
-              height: _videoController!.value.size.height,
-              child: VideoPlayer(_videoController!),
+              width: double.infinity,
+              height: double.infinity,
+              child: VlcPlayer(
+                key: ValueKey("vlc_$vlcWidgetVersion"),
+                controller: vlcController!,
+                aspectRatio: 9 / 16,
+                placeholder: const Center(child: CircularProgressIndicator()),
+              ),
             ),
           ),
         );
       } else {
         content = const Center(
           child: Text(
-            "Cargando contenido...",
+            "Sin contenido cargado",
             style: TextStyle(color: Colors.white, fontSize: 24),
           ),
         );
@@ -483,6 +626,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     const SizedBox(height: 8),
                     Text(
                       "Items:\n${items.length}",
+                      style: const TextStyle(color: Colors.white, fontSize: 14),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      "Índice actual:\n$currentIndex",
                       style: const TextStyle(color: Colors.white, fontSize: 14),
                     ),
                   ],
